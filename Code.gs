@@ -324,11 +324,12 @@ function doPost(e) {
   try {
     var body = JSON.parse(e.postData.contents);
 
-    /* ----- ช่องทางบอท: พนักงานขอสลิปของตัวเอง -----
-       เส้นเดิม (ใบลงเวลา) ไม่มี action → ต้องตกลงไปทางเดิมเสมอ ห้ามเปลี่ยนพฤติกรรมของเดิม
-       เส้นใหม่ต้องมีรหัสลับทุกครั้ง เพราะ URL /exec นี้ใครยิงก็ได้ */
+    /* ทุกคำขอจากบอทต้องมีรหัสลับ (BOT_SECRET) — URL /exec นี้ใครยิงก็ได้
+       เดิมเส้นใบลงเวลา (ไม่มี action) เปิดโล่ง → ใครมีลิงก์ก็ยัดแถวเวลาเข้าชีตได้ และใช้แถวนั้นผูก LINE id
+       กับรหัสพนักงานคนอื่นเพื่อขอสลิปเขาได้ → ปิดแล้ว (8 ต.ค. 69) บอทเก่าที่ไม่ส่ง secret ต้องเพิ่ม secret ก่อนใช้ */
+    if (!botAuthOk_(body.secret)) return jsonOut_({ ok: false, reason: 'unauthorized' });
     if (body.action) {
-      if (!botAuthOk_(body.secret)) return jsonOut_({ ok: false, reason: 'unauthorized' });
+      if (body.action === 'timesheet_image') return jsonOut_(botTimesheetImage_(body));
       if (body.action === 'payslip_list') return jsonOut_(botPayslipList_(body.lineUserId, { month: body.month }));
       if (body.action === 'payslip_file') return jsonOut_(botPayslipFile_(body.lineUserId, body.from, body.to));
       return jsonOut_({ ok: false, reason: 'unknown_action' });
@@ -385,6 +386,79 @@ function appendAttendanceRows_(ss, att, body, rows, head, fileUrl) {
     + (futureCount ? ' ⚠ วันที่ล่วงหน้า ' + futureCount + ' แถว — ต้องตรวจสอบ' : '');
   ss.getSheetByName('Import_Log').appendRow([new Date().toISOString(), body.lineUserId || '', body.displayName || '', fileUrl, 'สำเร็จ', note]);
   return { ok: true, id: ids[0], ids: ids, count: ids.length, fileUrl: fileUrl };
+}
+
+/* ================= บอท LINE ส่งรูปใบลงเวลา → อ่านด้วย AI ฝั่งนี้ → บันทึก "รอตรวจสอบ" =================
+   บอทไม่ต้องมีตัวอ่าน OCR ของตัวเอง — ใช้ ocrTimesheetImage_ (TimesheetOcr.gs) ตัวเดียวกับหน้าเว็บ + คีย์ GEMINI_API_KEY ชุดเดียว
+   payload = {action:'timesheet_image', secret, lineUserId, displayName, image(base64), contentType}
+   - รหัสพนักงานอ่านจากหัวใบ ต้องมีในทะเบียน ไม่งั้นไม่บันทึก (ไม่รับรหัสพนักงานที่บอทส่งมาเอง)
+   - เก็บรูปลง 01_Inbox ก่อนเรียก AI เสมอ (AI ล้มก็ยังมีรูปให้ HR กรอกเอง)
+   - แถวที่อ่านวันที่/เวลาไม่ออกไม่บันทึก แจ้งจำนวนกลับให้บอทบอกพนักงาน
+   คืน {ok, count, skipped, employee_id, employee_name, period_from, period_to, rows[], warnings[]} หรือ {ok:false, reason, error} */
+var BOT_TS_IMAGE_MAX = 10 * 1024 * 1024;
+function botTimesheetImage_(body) {
+  var uid = String(body.lineUserId || '').trim();
+  var isTest = /^TEST_BOT_[A-Za-z0-9_]{4,40}$/.test(uid);
+  if (!/^U[0-9a-f]{32}$/.test(uid) && !isTest) return { ok: false, reason: 'bad_user', error: 'LINE id ไม่ถูกต้อง' };
+  var b64 = String(body.image || '').replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+  var bytes;
+  try { bytes = Utilities.base64Decode(b64); } catch (e) { return { ok: false, reason: 'bad_image', error: 'ไฟล์รูปเสียหาย ส่งใหม่อีกครั้ง' }; }
+  if (!bytes || !bytes.length) return { ok: false, reason: 'bad_image', error: 'ไม่พบรูปใบลงเวลา' };
+  if (bytes.length > BOT_TS_IMAGE_MAX) return { ok: false, reason: 'too_large', error: 'รูปใหญ่เกิน ' + (BOT_TS_IMAGE_MAX / 1048576) + ' MB' };
+  var b0 = bytes[0] & 255, b1 = bytes[1] & 255, b2 = bytes[2] & 255, b3 = bytes[3] & 255;
+  var isJpeg = b0 === 0xFF && b1 === 0xD8 && b2 === 0xFF, isPng = b0 === 0x89 && b1 === 0x50 && b2 === 0x4E && b3 === 0x47;
+  if (!isJpeg && !isPng) return { ok: false, reason: 'bad_image', error: 'รองรับเฉพาะรูป JPG/PNG' };
+  var mime = isPng ? 'image/png' : 'image/jpeg';
+  var displayName = webTsStr_(body.displayName, 80);
+
+  // ชื่อไฟล์ขึ้นต้น TEST_BOT_ เฉพาะคำขอทดสอบ → apiPurgeBotTest เก็บกวาดได้ · ของจริงขึ้นต้น LINE_
+  var base = (isTest ? 'TEST_BOT_' : 'LINE_') + Utilities.formatDate(new Date(), TZ, 'yyyyMMdd_HHmmss') + '_' + Math.floor(Math.random() * 900 + 100);
+  var inbox = subFolder_('01_Inbox');
+  var file = inbox.createFile(Utilities.newBlob(bytes, mime, base + (isPng ? '.png' : '.jpg')));
+  var ss = getSs_();
+  var logFail = function (msg) {
+    try { ss.getSheetByName('Import_Log').appendRow([new Date().toISOString(), uid, displayName, file.getUrl(), 'ผิดพลาด', 'LINE: ' + msg]); } catch (e) {}
+  };
+
+  var res;
+  if (typeof ocrTimesheetImage_ !== 'function') res = { ok: false, error: 'ยังไม่ได้ติดตั้งตัวอ่านใบลงเวลา (TimesheetOcr.gs)' };
+  else {
+    try { res = ocrTimesheetImage_(b64, mime, {}); }
+    catch (e) { res = { ok: false, error: 'AI อ่านรูปไม่สำเร็จ: ' + String(e && e.message || e) }; }
+  }
+  if (!res || typeof res !== 'object') res = { ok: false, error: 'ตัวอ่านใบลงเวลาไม่ส่งผลกลับมา' };
+  try { inbox.createFile(Utilities.newBlob(JSON.stringify({ source: 'line', line_user_id: uid, result: res }, null, 2), 'application/json', base + '_ocr.json')); } catch (e) {}
+  if (!res.ok) { logFail(String(res.error || 'อ่านรูปไม่สำเร็จ')); return { ok: false, reason: 'ocr_failed', error: webTsStr_(res.error || 'อ่านรูปไม่สำเร็จ', 300) }; }
+
+  var h = res.header || {};
+  // รหัสฟอร์มอ่านออกและไม่ใช่ PAY-TS = ใบของบริษัทอื่น/ฟอร์มอื่น → ไม่บันทึก (อ่านไม่ออก = ปล่อยผ่าน เพราะ is_timesheet กรองแล้ว)
+  var form = String(h.form_code || '').toUpperCase().replace(/\s+/g, '');
+  if (form && form.indexOf('PAY-TS') < 0) { logFail('รหัสฟอร์มไม่ใช่ PAY-TS (' + form + ')'); return { ok: false, reason: 'wrong_form', error: 'ใบนี้ไม่ใช่ฟอร์มใบลงเวลาของบริษัท (PAY-TS)' }; }
+  var emp = findEmployee_(h.employee_id);
+  if (!emp) {
+    logFail('ไม่พบรหัสพนักงาน "' + webTsStr_(h.employee_id, 20) + '" ในทะเบียน');
+    return { ok: false, reason: 'unknown_employee', error: 'อ่านรหัสพนักงานที่หัวใบได้ "' + webTsStr_(h.employee_id, 20) + '" แต่ไม่พบในทะเบียน', read_id: webTsStr_(h.employee_id, 20) };
+  }
+
+  var rows = [], skipped = 0;
+  (res.rows || []).slice(0, WEB_TS_MAX_ROWS).forEach(function (r) {
+    r = r || {};
+    var d = normDate_(r.work_date), ci = r.check_in ? hhmmStrict_(r.check_in) : '', co = r.check_out ? hhmmStrict_(r.check_out) : '';
+    if (r.unreadable || !d || ci === null || co === null || (!ci && !co)) { skipped++; return; }
+    rows.push({ employee_id: String(emp.employee_id), employee_name: emp.employee_name || '', work_date: d, check_in: ci, check_out: co,
+      break_minutes: '', normal_hours: '', ot_hours: '' });
+  });
+  if (!rows.length) { logFail('ไม่มีแถวที่อ่านได้ (ข้าม ' + skipped + ')'); return { ok: false, reason: 'no_rows', error: 'อ่านแถววันที่/เวลาไม่ออกเลย', skipped: skipped }; }
+
+  var out = appendAttendanceRows_(ss, ss.getSheetByName('Attendance'), {
+    lineUserId: uid, displayName: displayName, receivedAt: new Date().toISOString(),
+    summary: 'ส่งผ่าน LINE · ' + (emp.employee_name || emp.employee_id) + (skipped ? ' · อ่านไม่ออก ' + skipped + ' แถว (ไม่บันทึก)' : ''),
+  }, rows, rows[0], file.getUrl());
+  return { ok: true, count: out.count, skipped: skipped,
+    employee_id: String(emp.employee_id), employee_name: emp.employee_name || '',
+    period_from: webTsStr_(h.period_from, 10), period_to: webTsStr_(h.period_to, 10),
+    rows: rows.map(function (r) { return { work_date: r.work_date, check_in: r.check_in, check_out: r.check_out }; }),
+    warnings: (res.warnings || []).slice(0, 10).map(function (w) { return webTsStr_(w, 200); }) };
 }
 
 /* ================= หน้าเว็บ: อัปรูปใบลงเวลา → AI อ่าน → ตรวจแก้ → บันทึก =================
@@ -1229,7 +1303,7 @@ function setupBotSecret() {
   }
   console.log('===== รหัสลับสำหรับบอท (' + (made ? 'สร้างใหม่' : 'ของเดิมที่ตั้งไว้แล้ว') + ') =====');
   console.log(v);
-  console.log('เอาค่าข้างบนไปตั้งเป็น GAS_SHARED_SECRET ที่ฝั่งบอท (Railway → Variables)');
+  console.log('เอาค่าข้างบนไปตั้งที่ฝั่งบอท: Cloudflare Worker line-oa-assistant → Secret ชื่อ PAYROLL_SECRET (บอทเก่าบน Railway = GAS_SHARED_SECRET)');
   // ไม่ return ค่ากลับ (15 ก.ย. 69): ฟังก์ชันที่ไม่มี _ ท้ายชื่อ ถูกเรียกผ่าน google.script.run จากหน้าเว็บได้
   // และเว็บนี้เปิดแบบ ANYONE_ANONYMOUS — ถ้าคืนค่า ใครมีลิงก์เว็บก็ดึงรหัสลับไปขอสลิปคนอื่นได้ · ดูค่าได้จาก Execution log เท่านั้น
 }
@@ -1305,6 +1379,9 @@ function payslipEmployeeOf_(lineUserId) {
   var found = null;
   for (var i = rows.length - 1; i >= 0; i--) {
     if (String(rows[i].line_user_id || '').trim() !== uid) continue;
+    // ผูกจากแถวที่ HR ตรวจแล้วเท่านั้น — แถว "รอตรวจสอบ" ยังไม่มีใครยืนยันว่าคนส่งเป็นเจ้าของรหัสนั้นจริง
+    // (กันถ่ายใบลงเวลาของเพื่อนส่งเข้าบอท แล้วขอสลิปของเพื่อนได้ทันที)
+    if (['ตรวจสอบแล้ว', 'อนุมัติแล้ว'].indexOf(String(rows[i].status || '').trim()) < 0) continue;
     var id = String(rows[i].employee_id || '').trim();
     if (id) { found = { employee_id: id, employee_name: rows[i].employee_name || rows[i].display_name || '' }; break; }
   }

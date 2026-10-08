@@ -64,7 +64,8 @@ function tsocrBuildResult_(d, model, opts, today) {
     name: tsocrStr_(d.employee_name).replace(/\s+/g, ' '),
     employee_id: tsocrThaiDigits_(tsocrStr_(d.employee_id)).replace(/[\s\-_.|\[\]]+/g, '').toUpperCase(),
     period_from: tsocrNormDate_(d.period_start),
-    period_to: tsocrNormDate_(d.period_end)
+    period_to: tsocrNormDate_(d.period_end),
+    form_code: tsocrStr_(d.form_code).slice(0, 40)
   };
   if (header.period_from && !header.period_to) header.period_to = header.period_from;
   if (!header.name && !header.employee_id) warnings.push('อ่านชื่อ/รหัสพนักงานที่หัวกระดาษไม่ออก — กรอกเองก่อนบันทึก');
